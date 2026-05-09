@@ -1,0 +1,54 @@
+{
+  "Version": 1,
+  "WorkspaceRootPath": "C:\\Users\\gal12\\OneDrive\\Documents\\GitHub\\uhd.net\\",
+  "Documents": [
+    {
+      "AbsoluteMoniker": "D:0:0:{3F9D9D9F-2B2B-5F3E-9D2C-1F3D9F2B2B3E}|tests\\UhdNet.Tests\\UhdNet.Tests.csproj|c:\\users\\gal12\\onedrive\\documents\\github\\uhd.net\\tests\\uhdnet.tests\\examples\\rxsamplestofile.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{3F9D9D9F-2B2B-5F3E-9D2C-1F3D9F2B2B3E}|tests\\UhdNet.Tests\\UhdNet.Tests.csproj|solutionrelative:tests\\uhdnet.tests\\examples\\rxsamplestofile.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{3F9D9D9F-2B2B-5F3E-9D2C-1F3D9F2B2B3E}|tests\\UhdNet.Tests\\UhdNet.Tests.csproj|c:\\users\\gal12\\onedrive\\documents\\github\\uhd.net\\tests\\uhdnet.tests\\program.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{3F9D9D9F-2B2B-5F3E-9D2C-1F3D9F2B2B3E}|tests\\UhdNet.Tests\\UhdNet.Tests.csproj|solutionrelative:tests\\uhdnet.tests\\program.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    }
+  ],
+  "DocumentGroupContainers": [
+    {
+      "Orientation": 0,
+      "VerticalTabListWidth": 256,
+      "DocumentGroups": [
+        {
+          "DockedWidth": 200,
+          "SelectedChildIndex": 0,
+          "Children": [
+            {
+              "$type": "Document",
+              "DocumentIndex": 0,
+              "Title": "RxSamplesToFile.cs",
+              "DocumentMoniker": "C:\\Users\\gal12\\OneDrive\\Documents\\GitHub\\uhd.net\\tests\\UhdNet.Tests\\Examples\\RxSamplesToFile.cs",
+              "RelativeDocumentMoniker": "tests\\UhdNet.Tests\\Examples\\RxSamplesToFile.cs",
+              "ToolTip": "C:\\Users\\gal12\\OneDrive\\Documents\\GitHub\\uhd.net\\tests\\UhdNet.Tests\\Examples\\RxSamplesToFile.cs",
+              "RelativeToolTip": "tests\\UhdNet.Tests\\Examples\\RxSamplesToFile.cs",
+              "ViewState": "AgIAAFYAAAAAAAAAAAAewGEAAAAyAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-05-09T20:30:15.867Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 1,
+              "Title": "Program.cs",
+              "DocumentMoniker": "C:\\Users\\gal12\\OneDrive\\Documents\\GitHub\\uhd.net\\tests\\UhdNet.Tests\\Program.cs",
+              "RelativeDocumentMoniker": "tests\\UhdNet.Tests\\Program.cs",
+              "ToolTip": "C:\\Users\\gal12\\OneDrive\\Documents\\GitHub\\uhd.net\\tests\\UhdNet.Tests\\Program.cs",
+              "RelativeToolTip": "tests\\UhdNet.Tests\\Program.cs",
+              "ViewState": "AgIAAAYAAAAAAAAAAAAAABEAAAAvAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-05-09T20:30:10.284Z",
+              "EditorCaption": ""
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
