@@ -82,6 +82,35 @@ public sealed unsafe class RxStreamer : IDisposable
     }
 
     /// <summary>
+    /// Zero-check hot path for single-channel receive. Skips all null/disposed guards.
+    /// Caller contract: streamer and metadata handle are valid for the duration of the call.
+    /// <para>
+    /// Set up once before the recv loop, then reuse each iteration:
+    /// <code>
+    ///   void** buffs = stackalloc void*[1];
+    ///   UhdRxMetadataHandle mdH = metadata.Handle;
+    ///   // per iteration:
+    ///   buffs[0] = myBuffer;
+    ///   streamer.ReceiveFast(buffs, want, &amp;mdH, timeout, false);
+    /// </code>
+    /// </para>
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [SkipLocalsInit]
+    public nuint ReceiveFast(
+        void** buffs,
+        nuint samplesPerBuffer,
+        UhdRxMetadataHandle* md,
+        double timeoutSeconds,
+        bool onePacket)
+    {
+        nuint received;
+        Interop.Check(NativeMethods.uhd_rx_streamer_recv_fast(
+            _handle, buffs, samplesPerBuffer, md, timeoutSeconds, onePacket, &received));
+        return received;
+    }
+
+    /// <summary>
     /// Multi-channel receive. <paramref name="channelBuffers"/> must contain one pointer per
     /// channel of the streamer; each buffer must be at least
     /// <paramref name="samplesPerBuffer"/> samples wide.

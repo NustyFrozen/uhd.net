@@ -165,6 +165,21 @@ public static unsafe partial class NativeMethods
         [MarshalAs(UnmanagedType.U1)] bool one_packet,
         nuint* items_recvd);
 
+    // Suppress the GC transition for the hot recv path. Safe when called inside
+    // GC.TryStartNoGCRegion: GC is already pinned, and in normal streaming the call
+    // returns within a packet period (µs-range), not the full timeout.
+    [LibraryImport(Lib, EntryPoint = "uhd_rx_streamer_recv")]
+    [UnmanagedCallConv(CallConvs = new[] { typeof(System.Runtime.CompilerServices.CallConvCdecl) })]
+    [SuppressGCTransition]
+    internal static partial UhdErrorCode uhd_rx_streamer_recv_fast(
+        UhdRxStreamerHandle h,
+        void** buffs,
+        nuint samps_per_buff,
+        UhdRxMetadataHandle* md,
+        double timeout,
+        [MarshalAs(UnmanagedType.U1)] bool one_packet,
+        nuint* items_recvd);
+
     [LibraryImport(Lib)]
     [UnmanagedCallConv(CallConvs = new[] { typeof(System.Runtime.CompilerServices.CallConvCdecl) })]
     public static partial UhdErrorCode uhd_rx_streamer_issue_stream_cmd(UhdRxStreamerHandle h, UhdStreamCmdNative* cmd);
@@ -257,6 +272,7 @@ public static unsafe partial class NativeMethods
 
     [LibraryImport(Lib)]
     [UnmanagedCallConv(CallConvs = new[] { typeof(System.Runtime.CompilerServices.CallConvCdecl) })]
+    [SuppressGCTransition] // reads a field on an already-live native object — always sub-µs
     public static partial UhdErrorCode uhd_rx_metadata_error_code(UhdRxMetadataHandle h, UhdRxMetadataErrorCode* code);
 
     [LibraryImport(Lib)]
