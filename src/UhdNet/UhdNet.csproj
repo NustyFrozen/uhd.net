@@ -11,10 +11,20 @@
     <TieredPGO>true</TieredPGO>
     <Optimize>true</Optimize>
     <Description>High-performance, zero-allocation C# wrapper for the Ettus Research USRP Hardware Driver (UHD).</Description>
-    <Authors>uhd.net contributors</Authors>
+    <Authors>NustyFrozen</Authors>
     <PackageId>UhdNet</PackageId>
     <Version>0.1.0</Version>
+    <PackageProjectUrl>https://github.com/NustyFrozen/uhd.net</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/NustyFrozen/uhd.net</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageLicenseExpression>AGPL-3.0-only</PackageLicenseExpression>
+    <PackageReadmeFile>README.MD</PackageReadmeFile>
+    <PackageTags>uhd;usrp;sdr;radio;ettus</PackageTags>
   </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.MD" Pack="true" PackagePath="\" />
+  </ItemGroup>
 
   <PropertyGroup Condition="'$(Configuration)' == 'Release'">
     <DebugType>portable</DebugType>
