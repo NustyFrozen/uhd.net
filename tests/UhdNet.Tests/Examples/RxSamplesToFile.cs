@@ -1,370 +1,560 @@
 using System;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
+using System.Threading.Channels;
 using UhdNet;
 using UhdNet.Native;
 
 namespace UhdNet.Tests.Examples;
 
 /// <summary>
-/// Port of UHD's <c>rx_samples_to_file</c>: stream samples from a single RX channel into a file.
+/// High-performance port of UHD's <c>rx_samples_to_file</c> example.
 ///
-/// Equivalent to:
-/// <code>
-/// rx_samples_to_file --args="" --file=samples.bin --type=short --duration=10
-///                    --rate=1e6 --freq=2.4e9 --gain=40 --ant=RX2 --bw=1e6
-/// </code>
+/// Architecture:
+///   - NativeMemory ring buffer: sample buffers live entirely outside the GC heap
+///     (64-byte aligned, no pinning needed in the recv path).
+///   - GC.TryStartNoGCRegion: suspends GC for the duration of the stream so that
+///     ReceiveFast ([SuppressGCTransition]) is always safe to call.
+///   - Producer/consumer: recv thread (Highest priority) fills slots; a dedicated
+///     writer thread (AboveNormal) drains them to disk — decoupling USB latency from I/O.
+///   - Thread priority + uhd_set_thread_priority: elevates the recv thread in both
+///     the .NET scheduler and the UHD driver thread pool.
+///   - Linux thread affinity: recv thread is pinned to core 1 via sched_setaffinity
+///     (core 0 is avoided as it handles hardware IRQs on many systems).
 /// </summary>
 internal static unsafe class RxSamplesToFile
 {
+    private const int    DefaultSpbMultiple = 8;          // SPB = MaxSamplesPerPacket × this
+    private const int    DefaultRingSlots   = 8;
+    private const long   NoGcHeapBudget     = 256L * 1024 * 1024;
+    private const int    MaxTimeouts        = 10;
+
+    // ─── Configuration ──────────────────────────────────────────────────────────
+
+    private sealed class Config
+    {
+        public string DeviceArgs  = string.Empty;
+        public string FilePath    = "samples.bin";
+        public string Type        = "short";      // short|sc16 or float|fc32
+        public string WireFmt     = "sc16";       // sc16, sc12, sc8
+        public double Rate        = 1e6;
+        public double Freq        = 0.0;
+        public double Gain        = 0.0;
+        public string Ant         = string.Empty;
+        public double Bw          = 0.0;
+        public long   NSamps      = 0;            // 0 = unlimited
+        public double Duration    = 0.0;          // seconds; 0 = unlimited
+        public int    Spb         = 0;            // 0 = auto
+        public int    RingSlots   = DefaultRingSlots;
+        public double SetupTime   = 1.0;
+        public bool   Progress    = true;
+        public bool   Stats       = true;
+    }
+
+    // ─── Ring slot ──────────────────────────────────────────────────────────────
+
+    private struct Slot
+    {
+        public void* Ptr;       // NativeMemory pointer (null = not allocated)
+        public nuint Bytes;     // allocated size
+        public int   Samples;   // samples filled by producer
+    }
+
+    // ─── Linux thread affinity (sched_setaffinity with tid=0 = current thread) ──
+
+    [DllImport("libc", EntryPoint = "sched_setaffinity", SetLastError = true)]
+    private static extern int sched_setaffinity(int pid, nuint cpusetsize, byte* mask);
+
+    // ─── Entry point ────────────────────────────────────────────────────────────
+
     public static int Run(string[] args)
     {
-        Options opts;
-        try { opts = Options.Parse(args); }
+        Config cfg;
+        try
+        {
+            cfg = ParseArgs(args);
+        }
+        catch (OperationCanceledException)
+        {
+            return 0;
+        }
         catch (Exception ex)
         {
-            Console.Error.WriteLine(ex.Message);
-            Options.PrintUsage();
+            Console.Error.WriteLine($"Argument error: {ex.Message}");
+            PrintUsage();
             return 1;
-        }
-
-        Console.WriteLine($"UHD version: {Uhd.VersionString}");
-        Console.WriteLine($"Creating USRP with args: \"{opts.DeviceArgs}\"...");
-
-        using var usrp = Usrp.Make(opts.DeviceArgs);
-        Console.WriteLine($"Using device:\n{usrp.GetPrettyString()}");
-
-        if (!string.IsNullOrEmpty(opts.ReferenceSource))
-            usrp.SetClockSource(opts.ReferenceSource);
-
-        Console.WriteLine($"Setting RX rate: {opts.SampleRate / 1e6:F3} Msps...");
-        usrp.SetRxRate(opts.SampleRate, opts.Channel);
-        Console.WriteLine($"Actual RX rate:  {usrp.GetRxRate(opts.Channel) / 1e6:F3} Msps");
-
-        Console.WriteLine($"Setting RX freq: {opts.Frequency / 1e6:F3} MHz...");
-        usrp.SetRxFrequency(new TuneRequest(opts.Frequency), opts.Channel, out var tune);
-        Console.WriteLine(
-            $"Actual RX freq:  {usrp.GetRxFrequency(opts.Channel) / 1e6:F3} MHz " +
-            $"(RF tuned to {tune.ActualRfFrequency / 1e6:F3} MHz, " +
-            $"DSP {tune.ActualDspFrequency / 1e3:+0.000;-0.000} kHz)");
-
-        Console.WriteLine($"Setting RX gain: {opts.Gain:F1} dB...");
-        usrp.SetRxGain(opts.Gain, opts.Channel);
-        Console.WriteLine($"Actual RX gain:  {usrp.GetRxGain(opts.Channel):F1} dB");
-
-        if (opts.Bandwidth > 0)
-        {
-            Console.WriteLine($"Setting RX bw:   {opts.Bandwidth / 1e6:F3} MHz...");
-            usrp.SetRxBandwidth(opts.Bandwidth, opts.Channel);
-            Console.WriteLine($"Actual RX bw:    {usrp.GetRxBandwidth(opts.Channel) / 1e6:F3} MHz");
-        }
-
-        if (!string.IsNullOrEmpty(opts.Antenna))
-            usrp.SetRxAntenna(opts.Antenna, opts.Channel);
-        Console.WriteLine($"Antenna: {usrp.GetRxAntenna(opts.Channel)}");
-
-        Thread.Sleep(opts.SetupDelay);
-
-        // Elevate priorities; ask UHD to pin its transport threads as realtime.
-        NativeMethods.uhd_set_thread_priority(1.0f, true);
-        Thread.CurrentThread.Priority = ThreadPriority.Highest;
-        Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.RealTime;
-
-        // sc16 CPU / sc12 OTW: 12-bit compressed on the wire saves ~25% USB/PCIe bandwidth.
-        var streamArgs = new StreamArgs
-        {
-            Channels = new[] { (nuint)opts.Channel },
-            Args = "num_recv_frames=16384",
-            CpuFormat = "sc8",
-            OtwFormat = "sc8",
-        };
-        using var streamer = usrp.GetRxStream(streamArgs);
-
-        nuint maxSpp = streamer.MaxSamplesPerPacket;
-        // Default to 32× max packet size so each recv/write round-trip amortises overhead well.
-        nuint bufferSamples = opts.BufferSamples == 0
-            ? maxSpp * 32
-            : (nuint)opts.BufferSamples;
-        if (bufferSamples < maxSpp) bufferSamples = maxSpp;
-
-        //int bytesPerSample = opts.SampleType == SampleType.Float ? sizeof(float) * 2 : sizeof(short) * 2;
-        int bytesPerSample = sizeof(byte) * 2;
-        nuint slotBytes = bufferSamples * (nuint)bytesPerSample;
-
-        Console.WriteLine($"Stream: cpu={streamArgs.CpuFormat}, otw={streamArgs.OtwFormat}, " +
-                          $"max_spp={maxSpp}, buffer={bufferSamples} samples");
-
-        // Two native-memory slots for double-buffering: recv fills one while the writer drains
-        // the other. Both are 64-byte aligned for any downstream SIMD processing.
-        const int NumSlots = 2;
-        var slotPtrs = new void*[NumSlots];
-        var slotWriteBytes = new int[NumSlots]; // bytes queued per slot; negative = stop sentinel
-
-        for (int i = 0; i < NumSlots; i++)
-        {
-            slotPtrs[i] = NativeMemory.AlignedAlloc(slotBytes, 64);
-            if (slotPtrs[i] == null) throw new OutOfMemoryException("AlignedAlloc returned null.");
         }
 
         try
         {
-            using var metadata = new RxMetadata();
-            using var output = new FileStream(
-                opts.OutputFile, FileMode.Create, FileAccess.Write, FileShare.None,
-                100 << 20, FileOptions.SequentialScan);
-
-            long targetSamples = opts.NumberOfSamples > 0
-                ? opts.NumberOfSamples
-                : opts.Duration > 0
-                    ? (long)(opts.Duration * usrp.GetRxRate(opts.Channel))
-                    : long.MaxValue;
-
-            var streamCmd = StreamCommand.StartContinuousNow;
-            Console.WriteLine(
-                $"Issuing stream command (mode={streamCmd.Mode}, target={targetSamples}). Press Ctrl+C to stop.");
-
-            using var stop = new CancellationTokenSource();
-            Console.CancelKeyPress += (_, e) => { e.Cancel = true; stop.Cancel(); };
-
-            streamer.IssueStreamCommand(streamCmd);
-
-            long total = 0;
-            long overflows = 0;
-            var sw = Stopwatch.StartNew();
-            var lastReport = TimeSpan.Zero;
-
-            // freeSlots: slots the recv thread may write into (starts full).
-            // readySlots: slots filled and waiting for the writer (starts empty).
-            var freeSlots = new SemaphoreSlim(NumSlots, NumSlots);
-            var readySlots = new SemaphoreSlim(0, NumSlots);
-            Exception? writerEx = null;
-
-            // Dedicated writer thread so disk I/O never blocks the recv loop.
-            var writerThread = new Thread(() =>
-            {
-                int idx = 0;
-                try
-                {
-                    while (true)
-                    {
-                        readySlots.Wait();
-                        int si = idx++ & 1;
-                        int n = slotWriteBytes[si];
-                        if (n < 0) return; // stop sentinel
-                        try { output.Write(new ReadOnlySpan<byte>(slotPtrs[si], n)); }
-                        finally { freeSlots.Release(); } // always release even on write exception
-                    }
-                }
-                catch (Exception ex) { writerEx = ex; }
-            });
-            writerThread.Priority = ThreadPriority.AboveNormal;
-            writerThread.IsBackground = true;
-            writerThread.Name = "rx-writer";
-            writerThread.Start();
-
-            // Hoist per-recv allocations outside the loop.
-            // stackalloc once: the JIT would otherwise repeat the stack adjustment every inlined call.
-            // Cache metadata.Handle: UHD never replaces the handle, so one managed-heap read suffices.
-            void** buffs = stackalloc void*[1];
-            UhdRxMetadataHandle mdHandle = metadata.Handle;
-
-            // Enter a no-GC region: prevents any collection on any thread for the duration of
-            // the recv loop. 64 MiB covers ~18 hours of once-per-second report strings without
-            // exhausting the budget. disallowFullBlockingGC:false — if the budget overflows GC
-            // runs normally instead of throwing; EndNoGCRegion then throws, which we swallow.
-            bool noGcActive = GC.TryStartNoGCRegion(64L << 20, disallowFullBlockingGC: false);
-
-            // Prevent the OS scheduler from migrating this thread to a different core mid-loop,
-            // which would invalidate L1/L2 cache lines holding the hot variables.
-            Thread.BeginThreadAffinity();
-
-            int pIdx = 0; // only incremented when a slot is successfully handed to the writer
-            try
-            {
-                while (!stop.IsCancellationRequested && total < targetSamples)
-                {
-                    if (writerEx != null)
-                    {
-                        Console.Error.WriteLine($"Writer thread failed: {writerEx.Message}");
-                        break;
-                    }
-
-                    // No CancellationToken on Wait: registering a token per call can allocate
-                    // and would blow the no-GC budget. Cancellation is handled by the
-                    // stop.IsCancellationRequested check at the top of the loop instead.
-                    freeSlots.Wait();
-
-                    int si = pIdx & 1;
-                    buffs[0] = slotPtrs[si];
-                    nuint want = (nuint)Math.Min((long)bufferSamples, targetSamples - total);
-                    nuint got = streamer.ReceiveFast(buffs, want, &mdHandle, opts.Timeout, onePacket: false);
-
-                    // Direct native call — bypasses ThrowIfDisposed and Interop.Check on the metadata query.
-                    UhdRxMetadataErrorCode errCode;
-                    NativeMethods.uhd_rx_metadata_error_code(mdHandle, &errCode);
-                    if (errCode != UhdRxMetadataErrorCode.None)
-                    {
-                        if ((errCode & UhdRxMetadataErrorCode.Overflow) != 0)
-                            overflows++;
-                        freeSlots.Release(); // return the unused slot
-                        if (!opts.ContinueOnError) break;
-                        continue;
-                    }
-
-                    if (got == 0) { freeSlots.Release(); continue; }
-
-                    slotWriteBytes[si] = checked((int)got * bytesPerSample);
-                    total += (long)got;
-                    pIdx++;
-                    readySlots.Release(); // hand slot to writer
-
-                    if (sw.Elapsed - lastReport > TimeSpan.FromSeconds(1))
-                    {
-                        lastReport = sw.Elapsed;
-                        Console.WriteLine(
-                            $"  rx {total:N0} samples ({(double)(total * bytesPerSample) / (1 << 20):F1} MiB) " +
-                            $"@ {total / sw.Elapsed.TotalSeconds / 1e6:F3} Msps, overflows={overflows}");
-                    }
-                }
-            }
-            finally
-            {
-                // Exit the no-GC and thread-affinity regions before any managed teardown.
-                Thread.EndThreadAffinity();
-                if (noGcActive)
-                {
-                    try { GC.EndNoGCRegion(); }
-                    catch (InvalidOperationException) { } // budget was exhausted; region already ended
-                }
-
-                // Send the stop sentinel to the writer and wait for it to drain.
-                freeSlots.Wait(); // always succeeds — writer's finally always releases
-                slotWriteBytes[pIdx & 1] = -1;
-                readySlots.Release();
-                writerThread.Join();
-            }
-
-            if (writerEx != null)
-                throw new Exception("Writer thread failed.", writerEx);
-
-            if (streamCmd.Mode == UhdStreamMode.StartContinuous)
-            {
-                streamer.IssueStreamCommand(StreamCommand.StopContinuous);
-                DrainRemaining(streamer, slotPtrs[0], bufferSamples, metadata, opts.Timeout);
-            }
-
-            output.Flush();
-            sw.Stop();
-
-            Console.WriteLine();
-            Console.WriteLine(
-                $"Done. Wrote {total:N0} samples ({(long)total * bytesPerSample:N0} bytes) " +
-                $"in {sw.Elapsed.TotalSeconds:F2}s ({total / sw.Elapsed.TotalSeconds / 1e6:F3} Msps).");
-            if (overflows > 0)
-                Console.WriteLine($"WARN: {overflows} overflow event(s); host could not keep up with the device.");
-            Console.WriteLine($"Output: {Path.GetFullPath(opts.OutputFile)}");
-            return 0;
+            Console.WriteLine($"Opening USRP: \"{cfg.DeviceArgs}\"");
+            using var usrp = Usrp.Make(cfg.DeviceArgs);
+            ConfigureUsrp(usrp, cfg);
+            return RunStream(usrp, cfg);
         }
         catch (UhdException ex)
         {
-            Console.Error.WriteLine($"UHD error: {ex.Code} - {ex.Message}");
+            Console.Error.WriteLine($"UHD error [{ex.Code}]: {ex.Message}");
             return 3;
+        }
+    }
+
+    // ─── Device configuration ────────────────────────────────────────────────────
+
+    private static void ConfigureUsrp(Usrp usrp, Config cfg)
+    {
+        usrp.SetRxRate(cfg.Rate);
+        Console.WriteLine($"Actual RX rate : {usrp.GetRxRate() / 1e6:F6} Msps");
+
+        usrp.SetRxFrequency(new TuneRequest(cfg.Freq), 0, out var tune);
+        Console.WriteLine($"Actual RX freq : {tune.ActualRfFrequency / 1e6:F6} MHz");
+
+        usrp.SetRxGain(cfg.Gain);
+        Console.WriteLine($"Actual RX gain : {usrp.GetRxGain():F1} dB");
+
+        if (!string.IsNullOrEmpty(cfg.Ant))
+            usrp.SetRxAntenna(cfg.Ant);
+        Console.WriteLine($"RX antenna     : {usrp.GetRxAntenna()}");
+
+        if (cfg.Bw > 0)
+        {
+            usrp.SetRxBandwidth(cfg.Bw);
+            Console.WriteLine($"Actual RX BW   : {usrp.GetRxBandwidth() / 1e6:F3} MHz");
+        }
+
+        if (cfg.SetupTime > 0)
+        {
+            Console.WriteLine($"Settling for {cfg.SetupTime:F1} s...");
+            Thread.Sleep(TimeSpan.FromSeconds(cfg.SetupTime));
+        }
+    }
+
+    // ─── Stream setup ────────────────────────────────────────────────────────────
+
+    private static int RunStream(Usrp usrp, Config cfg)
+    {
+        string cpuFmt        = cfg.Type is "short" or "sc16" ? "sc16" : "fc32";
+        int    bytesPerSample = cpuFmt == "sc16" ? 4 : 8;
+
+        using var rxStream = usrp.GetRxStream(new StreamArgs
+        {
+            CpuFormat = cpuFmt,
+            OtwFormat = cfg.WireFmt,
+            Channels  = new nuint[] { 0 },
+        });
+
+        nuint maxSpp  = rxStream.MaxSamplesPerPacket;
+        int   spb     = cfg.Spb > 0 ? cfg.Spb : Math.Max(8192, (int)maxSpp * DefaultSpbMultiple);
+        nuint slotBytes = (nuint)(spb * bytesPerSample);
+
+        Console.WriteLine(
+            $"MaxSamplesPerPacket={maxSpp}  SPB={spb} ({slotBytes / 1024.0:F1} KiB/slot)  ring={cfg.RingSlots}");
+
+        // Allocate ring buffer outside the GC heap; 64-byte alignment = cache line / AVX-512
+        var ring = new Slot[cfg.RingSlots];
+        try
+        {
+            for (int i = 0; i < cfg.RingSlots; i++)
+            {
+                ring[i].Ptr   = NativeMemory.AlignedAlloc(slotBytes, 64);
+                ring[i].Bytes = slotBytes;
+            }
+
+            // Suspend GC for the duration of streaming so ReceiveFast ([SuppressGCTransition])
+            // is always safe to call.  disallowFullBlockingGC=false lets the runtime do a full
+            // GC if the budget is exceeded rather than throwing.
+            bool noGc = GC.TryStartNoGCRegion(NoGcHeapBudget, disallowFullBlockingGC: false);
+            if (!noGc)
+                Console.WriteLine("Warning: GC.TryStartNoGCRegion failed — GC may cause latency spikes.");
+
+            try
+            {
+                return DoStream(rxStream, ring, (nuint)spb, bytesPerSample, cfg);
+            }
+            finally
+            {
+                if (noGc)
+                    try { GC.EndNoGCRegion(); } catch { /* already ended */ }
+            }
         }
         finally
         {
-            for (int i = 0; i < NumSlots; i++)
-                NativeMemory.AlignedFree(slotPtrs[i]);
+            for (int i = 0; i < cfg.RingSlots; i++)
+                if (ring[i].Ptr != null)
+                    NativeMemory.AlignedFree(ring[i].Ptr);
         }
     }
 
-    private static void DrainRemaining(RxStreamer streamer, void* buffer, nuint bufferSamples,
-                                       RxMetadata metadata, double timeout)
+    // ─── Pipeline ────────────────────────────────────────────────────────────────
+
+    private static int DoStream(
+        RxStreamer rxStream,
+        Slot[]     ring,
+        nuint      spb,
+        int        bytesPerSample,
+        Config     cfg)
     {
-        for (int i = 0; i < 16; i++)
+        int n = cfg.RingSlots;
+
+        // freeSlots:  slot indices available for the recv thread to fill
+        // readySlots: slot indices filled and waiting to be written
+        //
+        // Invariant: |free| + |ready| + |in-flight| == n  at all times.
+        // Consequence: TryWrite to either channel always succeeds when the slot was
+        // just taken from the other channel — capacity n is never exceeded.
+        var freeSlots = Channel.CreateBounded<int>(new BoundedChannelOptions(n)
         {
-            nuint got = streamer.Receive(buffer, bufferSamples, metadata, timeout, onePacket: true);
-            if (got == 0 || (metadata.ErrorCode & UhdRxMetadataErrorCode.Timeout) != 0) break;
+            FullMode    = BoundedChannelFullMode.Wait,
+            SingleReader = true,
+            SingleWriter = true,
+        });
+        var readySlots = Channel.CreateBounded<int>(new BoundedChannelOptions(n)
+        {
+            FullMode    = BoundedChannelFullMode.Wait,
+            SingleReader = true,
+            SingleWriter = true,
+        });
+
+        for (int i = 0; i < n; i++)
+            freeSlots.Writer.TryWrite(i);
+
+        var cts = new CancellationTokenSource();
+        Console.CancelKeyPress += (_, e) =>
+        {
+            e.Cancel = true;
+            cts.Cancel();
+            Console.WriteLine("\nInterrupted.");
+        };
+
+        using var outFile = new FileStream(
+            cfg.FilePath, FileMode.Create, FileAccess.Write, FileShare.None,
+            bufferSize: 65536, FileOptions.None);
+
+        var sw = Stopwatch.StartNew();
+        Exception? writerErr = null;
+
+        // Writer thread: drains readySlots to disk, returns indices to freeSlots
+        var writerThread = new Thread(() =>
+        {
+            try   { WriteWorker(outFile, ring, readySlots.Reader, freeSlots.Writer, bytesPerSample, cts.Token); }
+            catch (OperationCanceledException) { }
+            catch (Exception ex)               { Volatile.Write(ref writerErr, ex); cts.Cancel(); }
+        })
+        {
+            Name       = "uhd-file-writer",
+            Priority   = ThreadPriority.AboveNormal,
+            IsBackground = true,
+        };
+        writerThread.Start();
+
+        // Recv thread (current thread): elevate priority, pin to core, ask UHD driver to do the same
+        Thread.CurrentThread.Priority = ThreadPriority.Highest;
+        _ = NativeMethods.uhd_set_thread_priority(1.0f, realtime: true);
+        TryPinCurrentThreadToCore(1); // core 1: avoids core 0 which owns most hardware IRQs
+
+        long totalSamples = 0;
+        long overflows    = 0;
+
+        try
+        {
+            RecvWorker(rxStream, cfg, ring, freeSlots.Reader, freeSlots.Writer, readySlots.Writer,
+                       spb, cts.Token, ref totalSamples, ref overflows, sw);
         }
+        finally
+        {
+            readySlots.Writer.Complete(); // signal writer to drain and exit
+            writerThread.Join(TimeSpan.FromSeconds(30));
+        }
+
+        sw.Stop();
+
+        if (writerErr != null)
+        {
+            Console.Error.WriteLine($"Writer error: {writerErr.Message}");
+            return 4;
+        }
+
+        if (cfg.Stats)
+            PrintStats(totalSamples, overflows, bytesPerSample, sw.Elapsed);
+
+        return 0;
     }
 
-    private enum SampleType { Float, Short }
+    // ─── Recv worker ─────────────────────────────────────────────────────────────
+    //
+    // Hot-path constraints:
+    //   - All sample buffers are NativeMemory: no managed heap, no GC pressure.
+    //   - ReceiveFast uses [SuppressGCTransition]: safe inside GC.TryStartNoGCRegion.
+    //   - Error code is read via NativeMethods directly: no managed property dispatch.
+    //   - buffs[] is stackalloc'd once before the loop; only buffs[0] is updated.
+    //   - mdHandle is a value copy of the opaque metadata pointer; UHD fills the
+    //     pointed-to native struct in place — the handle value itself never changes.
 
-    private sealed class Options
+    private static void RecvWorker(
+        RxStreamer         streamer,
+        Config             cfg,
+        Slot[]             ring,
+        ChannelReader<int>  freeSlotReader,
+        ChannelWriter<int>  freeSlotWriter,
+        ChannelWriter<int>  readySlots,
+        nuint              spb,
+        CancellationToken  ct,
+        ref long           totalSamples,
+        ref long           overflows,
+        Stopwatch          sw)
     {
-        public string DeviceArgs = string.Empty;
-        public string OutputFile = "samples.bin";
-        public SampleType SampleType = SampleType.Short;
-        public double SampleRate = 30e6;
-        public double Frequency = 2.4e9;
-        public double Gain = 0;
-        public double Bandwidth = 0;
-        public string Antenna = string.Empty;
-        public string ReferenceSource = string.Empty;
-        public double Duration = 10;
-        public long NumberOfSamples = 0;
-        public double Timeout = 10.0;
-        public TimeSpan SetupDelay = TimeSpan.FromSeconds(1);
-        public nuint Channel = 0;
-        public int BufferSamples = 0;
-        public bool ContinueOnError = false;
+        using var metadata = new RxMetadata();
+        UhdRxMetadataHandle mdHandle = metadata.Handle;
 
-        public static Options Parse(string[] args)
+        // Stack-allocate the buffer-pointer array once; only [0] changes per iteration
+        void** buffs = stackalloc void*[1];
+
+        long   maxSamples  = cfg.NSamps   > 0 ? cfg.NSamps   : long.MaxValue;
+        double maxSecs     = cfg.Duration > 0 ? cfg.Duration : double.MaxValue;
+        double nextPrint   = 1.0;
+        int    timeouts    = 0;
+        bool   abort       = false;
+
+        streamer.IssueStreamCommand(StreamCommand.StartContinuousNow);
+
+        while (!abort && !ct.IsCancellationRequested &&
+               totalSamples < maxSamples &&
+               sw.Elapsed.TotalSeconds < maxSecs)
         {
-            var o = new Options();
-            for (int i = 0; i < args.Length; i++)
+            // Block until the writer returns a free slot
+            int idx;
+            try
             {
-                var a = args[i];
-                string Next() => i + 1 < args.Length ? args[++i] : throw new ArgumentException($"Missing value for {a}");
-                switch (a)
+                var vt = freeSlotReader.ReadAsync(ct);
+                idx = vt.IsCompletedSuccessfully ? vt.Result : vt.AsTask().GetAwaiter().GetResult();
+            }
+            catch (OperationCanceledException) { break; }
+            catch (ChannelClosedException)     { break; }
+
+            buffs[0] = ring[idx].Ptr;
+
+            nuint want = spb;
+            if (cfg.NSamps > 0)
+            {
+                nuint rem = (nuint)(maxSamples - totalSamples);
+                if (rem < want) want = rem;
+            }
+
+            // === Innermost call: zero GC-transition cost, raw native pointer ===
+            nuint got = streamer.ReceiveFast(buffs, want, &mdHandle, 0.5, onePacket: false);
+
+            // Read error code directly via NativeMethods (avoids managed property ThrowIfDisposed guard)
+            UhdRxMetadataErrorCode err;
+            _ = NativeMethods.uhd_rx_metadata_error_code(mdHandle, &err);
+
+            if (err == UhdRxMetadataErrorCode.Timeout)
+            {
+                freeSlotWriter.TryWrite(idx);     // return slot without writing
+                if (++timeouts >= MaxTimeouts)
                 {
-                    case "--args":     o.DeviceArgs = Next(); break;
-                    case "--file":     o.OutputFile = Next(); break;
-                    case "--type":     o.SampleType = Next() switch
-                    {
-                        "float" or "fc32" => SampleType.Float,
-                        "short" or "sc16" => SampleType.Short,
-                        var s => throw new ArgumentException($"Unknown --type {s}; use float|short."),
-                    }; break;
-                    case "--rate":     o.SampleRate    = double.Parse(Next(), System.Globalization.CultureInfo.InvariantCulture); break;
-                    case "--freq":     o.Frequency     = double.Parse(Next(), System.Globalization.CultureInfo.InvariantCulture); break;
-                    case "--gain":     o.Gain          = double.Parse(Next(), System.Globalization.CultureInfo.InvariantCulture); break;
-                    case "--bw":       o.Bandwidth     = double.Parse(Next(), System.Globalization.CultureInfo.InvariantCulture); break;
-                    case "--ant":      o.Antenna       = Next(); break;
-                    case "--ref":      o.ReferenceSource = Next(); break;
-                    case "--duration": o.Duration      = double.Parse(Next(), System.Globalization.CultureInfo.InvariantCulture); break;
-                    case "--nsamps":   o.NumberOfSamples = long.Parse(Next(), System.Globalization.CultureInfo.InvariantCulture); break;
-                    case "--timeout":  o.Timeout       = double.Parse(Next(), System.Globalization.CultureInfo.InvariantCulture); break;
-                    case "--channel":  o.Channel       = (nuint)uint.Parse(Next(), System.Globalization.CultureInfo.InvariantCulture); break;
-                    case "--buffer":   o.BufferSamples = int.Parse(Next(), System.Globalization.CultureInfo.InvariantCulture); break;
-                    case "--continue": o.ContinueOnError = true; break;
-                    case "-h" or "--help": PrintUsage(); Environment.Exit(0); break;
-                    default: throw new ArgumentException($"Unknown option: {a}");
+                    Console.Error.WriteLine($"ERROR: {MaxTimeouts} consecutive timeouts — aborting.");
+                    abort = true;
+                }
+                continue;
+            }
+
+            if (err != UhdRxMetadataErrorCode.None    &&
+                err != UhdRxMetadataErrorCode.BrokenChain &&
+                err != UhdRxMetadataErrorCode.Overflow)
+            {
+                Console.Error.WriteLine($"ERROR: recv returned {err} — aborting.");
+                freeSlotWriter.TryWrite(idx);
+                abort = true;
+                continue;
+            }
+
+            timeouts = 0;
+
+            if (err == UhdRxMetadataErrorCode.Overflow)
+                overflows++;
+            // Samples in `got` are valid even on overflow (data was dropped before us, not in this call)
+
+            ring[idx].Samples = (int)got;
+            totalSamples += (long)got;
+
+            // Hand the filled slot to the writer (always succeeds: see ring invariant comment above)
+            readySlots.TryWrite(idx);
+
+            if (cfg.Progress)
+            {
+                double t = sw.Elapsed.TotalSeconds;
+                if (t >= nextPrint)
+                {
+                    double msps = totalSamples / t / 1e6;
+                    Console.Write($"\r  {totalSamples / 1e6:F2} MSa   {msps:F3} Msps   overflows={overflows}  ");
+                    nextPrint = t + 1.0;
                 }
             }
-            return o;
         }
 
-        public static void PrintUsage()
+        streamer.IssueStreamCommand(StreamCommand.StopContinuous);
+    }
+
+    // ─── Write worker ────────────────────────────────────────────────────────────
+    //
+    // Reads ready slots in order, writes raw bytes to outFile, returns slots to freeSlots.
+    // FileStream.Write(ReadOnlySpan<byte>) over a NativeMemory pointer is a zero-copy path
+    // down to the OS write() syscall — no internal .NET buffer is used because our slot size
+    // (≥ 8192 samples) exceeds FileStream's internal buffer (64 KiB).
+
+    private static void WriteWorker(
+        FileStream         file,
+        Slot[]             ring,
+        ChannelReader<int>  readySlots,
+        ChannelWriter<int>  freeSlots,
+        int                bytesPerSample,
+        CancellationToken  ct)
+    {
+        while (true)
         {
-            Console.WriteLine("Usage: rx_samples_to_file [options]");
-            Console.WriteLine("  --args <s>     Device address args (e.g. \"type=b200\", \"addr=192.168.10.2\")");
-            Console.WriteLine("  --file <p>     Output file path (default: samples.bin)");
-            Console.WriteLine("  --type <t>     Sample type: float (fc32) or short (sc16, default)");
-            Console.WriteLine("  --rate <Hz>    Sample rate in samples/sec (default: 1e6)");
-            Console.WriteLine("  --freq <Hz>    Center frequency (default: 2.4e9)");
-            Console.WriteLine("  --gain <dB>    RX gain (default: 40)");
-            Console.WriteLine("  --bw <Hz>      Analog bandwidth (default: device default)");
-            Console.WriteLine("  --ant <name>   RX antenna (e.g. RX2)");
-            Console.WriteLine("  --ref <src>    Clock reference (e.g. internal, external)");
-            Console.WriteLine("  --duration <s> Capture duration in seconds (default: 10)");
-            Console.WriteLine("  --nsamps <n>   Capture exact number of samples (overrides --duration)");
-            Console.WriteLine("  --timeout <s>  Recv timeout (default: 3.0)");
-            Console.WriteLine("  --channel <n>  Channel index (default: 0)");
-            Console.WriteLine("  --buffer <n>   Buffer size in samples (default: 32 × max packet size)");
-            Console.WriteLine("  --continue     Continue on non-fatal errors (including overflows)");
+            int idx;
+            try
+            {
+                var vt = readySlots.ReadAsync(ct);
+                idx = vt.IsCompletedSuccessfully ? vt.Result : vt.AsTask().GetAwaiter().GetResult();
+            }
+            catch (OperationCanceledException) { return; }
+            catch (ChannelClosedException)     { return; }
+
+            ref Slot s = ref ring[idx];
+            if (s.Samples > 0)
+                file.Write(new ReadOnlySpan<byte>((byte*)s.Ptr, s.Samples * bytesPerSample));
+
+            freeSlots.TryWrite(idx);
         }
+    }
+
+    // ─── Stats ───────────────────────────────────────────────────────────────────
+
+    private static void PrintStats(long samples, long overflows, int bytesPerSample, TimeSpan elapsed)
+    {
+        double secs = elapsed.TotalSeconds;
+        double msps = samples / secs / 1e6;
+        double mibs = samples * (double)bytesPerSample / secs / (1024.0 * 1024.0);
+
+        Console.WriteLine();
+        Console.WriteLine("─── Benchmark results ─────────────────────────────────────");
+        Console.WriteLine($"  Elapsed     : {elapsed:c}");
+        Console.WriteLine($"  Samples     : {samples:N0}");
+        Console.WriteLine($"  Bytes       : {samples * (double)bytesPerSample / (1024.0 * 1024.0):F2} MiB");
+        Console.WriteLine($"  Throughput  : {msps:F4} Msps  /  {mibs:F2} MiB/s");
+        Console.WriteLine($"  Overflows   : {overflows}");
+        if (overflows > 0)
+            Console.WriteLine("  NOTE: Overflows mean the USRP FPGA FIFO overflowed — samples were dropped");
+        Console.WriteLine("────────────────────────────────────────────────────────────");
+    }
+
+    // ─── Argument parsing ────────────────────────────────────────────────────────
+
+    private static Config ParseArgs(string[] argv)
+    {
+        var cfg = new Config();
+        for (int i = 0; i < argv.Length; i++)
+        {
+            string a = argv[i];
+            string V() => i + 1 < argv.Length
+                ? argv[++i]
+                : throw new ArgumentException($"Missing value after '{a}'");
+            double D() => double.Parse(V(), CultureInfo.InvariantCulture);
+
+            switch (a)
+            {
+                case "--args":       case "-a": cfg.DeviceArgs = V();         break;
+                case "--file":       case "-o": cfg.FilePath   = V();         break;
+                case "--type":       case "-t": cfg.Type       = V();         break;
+                case "--wirefmt":               cfg.WireFmt    = V();         break;
+                case "--rate":       case "-r": cfg.Rate       = D();         break;
+                case "--freq":       case "-f": cfg.Freq       = D();         break;
+                case "--gain":       case "-g": cfg.Gain       = D();         break;
+                case "--ant":                   cfg.Ant        = V();         break;
+                case "--bw":                    cfg.Bw         = D();         break;
+                case "--nsamps":     case "-n": cfg.NSamps     = long.Parse(V()); break;
+                case "--duration":   case "-d": cfg.Duration   = D();         break;
+                case "--spb":                   cfg.Spb        = int.Parse(V()); break;
+                case "--ring":                  cfg.RingSlots  = int.Parse(V()); break;
+                case "--setup-time":            cfg.SetupTime  = D();         break;
+                case "--no-progress":           cfg.Progress   = false;       break;
+                case "--no-stats":              cfg.Stats      = false;       break;
+                case "--help":       case "-h": PrintUsage(); throw new OperationCanceledException();
+                default:
+                    if (a.StartsWith('-'))
+                        throw new ArgumentException($"Unknown option '{a}'");
+                    break;
+            }
+        }
+
+        if (cfg.Type is not ("short" or "sc16" or "float" or "fc32"))
+            throw new ArgumentException($"--type must be 'short'/'sc16' or 'float'/'fc32'; got '{cfg.Type}'");
+        if (cfg.RingSlots < 2)
+            throw new ArgumentException("--ring must be >= 2");
+        if (cfg.Spb < 0)
+            throw new ArgumentException("--spb must be >= 0");
+
+        return cfg;
+    }
+
+    private static void PrintUsage() => Console.WriteLine("""
+        rx_samples_to_file — high-performance USRP RX benchmark (UHD.NET / C#)
+
+        Usage:
+          UhdNet.Tests rx_samples_to_file [options]
+
+        Core options:
+          -a, --args <str>      Device args e.g. "type=b200" (default: "")
+          -o, --file <path>     Output file path (default: samples.bin)
+          -t, --type <str>      CPU sample format: short|sc16 or float|fc32 (default: short)
+              --wirefmt <str>   Over-the-wire format: sc16, sc12, sc8 (default: sc16)
+          -r, --rate <Hz>       Sample rate; scientific notation ok: 1e6, 2.5e6 (default: 1e6)
+          -f, --freq <Hz>       Center frequency (default: 0)
+          -g, --gain <dB>       RX gain dB (default: 0)
+              --ant <name>      Antenna name (default: device default)
+              --bw <Hz>         Analog bandwidth — 0 = no override (default: 0)
+
+        Capture control:
+          -n, --nsamps <N>      Samples to capture; 0 = unlimited (default: 0)
+          -d, --duration <s>    Duration in seconds; 0 = unlimited (default: 0)
+
+        Performance tuning:
+              --spb <N>         Samples per buffer; 0 = auto (MaxSPP×8) (default: 0)
+              --ring <N>        NativeMemory ring slot count (default: 8)
+              --setup-time <s>  Post-tune settle time in seconds (default: 1.0)
+
+        Output:
+              --no-progress     Suppress live throughput display
+              --no-stats        Suppress final benchmark summary
+          -h, --help            Show this help and exit
+
+        Examples:
+          rx_samples_to_file --freq 2.4e9 --rate 1e6 --gain 40 --duration 10
+          rx_samples_to_file -a "type=b200" -f 433e6 -r 2e6 -g 30 -n 20000000 -t float
+          rx_samples_to_file -f 915e6 -r 10e6 -d 5 --spb 32768 --ring 16 --no-progress
+        """);
+
+    // ─── Linux thread affinity ───────────────────────────────────────────────────
+
+    private static void TryPinCurrentThreadToCore(int core)
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Linux)) return;
+        if ((uint)core >= 1024) return;
+        try
+        {
+            // cpu_set_t on Linux is 128 bytes (1024 CPUs × 1 bit).
+            // pid=0 means "current thread" in sched_setaffinity.
+            byte* mask = stackalloc byte[128];
+            new Span<byte>(mask, 128).Clear();
+            mask[core / 8] |= (byte)(1 << (core % 8));
+            if (sched_setaffinity(0, 128, mask) != 0)
+                Console.WriteLine($"Note: thread affinity not set (errno={Marshal.GetLastPInvokeError()}).");
+        }
+        catch { }
     }
 }
